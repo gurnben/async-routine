@@ -4,6 +4,7 @@ package async
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -44,6 +45,7 @@ type AsyncRoutine interface {
 }
 
 type asyncRoutine struct {
+	mu               sync.RWMutex
 	routineId        string
 	name             string
 	routine          func()
@@ -68,14 +70,20 @@ func (r *asyncRoutine) CreatedAt() time.Time {
 }
 
 func (r *asyncRoutine) StartedAt() *time.Time {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.startedAt
 }
 
 func (r *asyncRoutine) FinishedAt() *time.Time {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.finishedAt
 }
 
 func (r *asyncRoutine) Status() RoutineStatus {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.status
 }
 
@@ -96,19 +104,31 @@ func (r *asyncRoutine) GetData() map[string]string {
 }
 
 func (r *asyncRoutine) isStarted() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.startedAt != nil
 }
 
 func (r *asyncRoutine) isFinished() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.finishedAt != nil
 }
 
 func (r *asyncRoutine) isRunning() bool {
-	return r.isStarted() && !r.isFinished()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.isRunningLocked()
+}
+
+func (r *asyncRoutine) isRunningLocked() bool {
+	return r.startedAt != nil && r.finishedAt == nil
 }
 
 func (r *asyncRoutine) hasExceededTimebox() bool {
-	if r.isRunning() && r.timebox != nil && time.Now().UTC().After(r.startedAt.Add(*r.timebox)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.isRunningLocked() && r.timebox != nil && time.Now().UTC().After(r.startedAt.Add(*r.timebox)) {
 		r.status = RoutineStatusExceededTimebox
 		return true
 	}
@@ -121,7 +141,6 @@ func (r *asyncRoutine) id() string {
 
 func (r *asyncRoutine) run(manager AsyncRoutineManager) {
 	if r.isStarted() {
-		// already running
 		return
 	}
 
@@ -132,18 +151,21 @@ func (r *asyncRoutine) run(manager AsyncRoutineManager) {
 
 	manager.register(r)
 	now := time.Now().UTC()
+	r.mu.Lock()
 	r.startedAt = &now
 	r.status = RoutineStatusRunning
+	r.mu.Unlock()
 
 	updateFinishedRoutine := func(r *asyncRoutine) {
 		finishedAt := time.Now().UTC()
+		r.mu.Lock()
 		r.finishedAt = &finishedAt
-
 		if r.status == RoutineStatusExceededTimebox {
 			r.status = RoutineStatusFinishedExceededTimebox
 		} else {
 			r.status = RoutineStatusFinished
 		}
+		r.mu.Unlock()
 		manager.deregister(r)
 		manager.notify(func(observer RoutinesObserver) {
 			observer.RoutineFinished(r)
